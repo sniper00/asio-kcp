@@ -450,9 +450,9 @@ namespace moon
         public:
             connection(udp::socket* sock, uint32_t conv, udp::endpoint& endpoint, bool isserver = true)
                 : isserver_(isserver)
+                , conv_(conv)
                 , now_tick_(clock())
                 , sock_(sock)
-                , conv_(conv)
                 , endpoint_(std::move(endpoint))
             {
                 assert(sock_);
@@ -803,9 +803,9 @@ namespace moon
         private:
             uint32_t conv_ = 0;
             time_t now_ = clock();
+            std::string magic_;
             udp::socket sock_;
             udp::endpoint from_;
-            std::string magic_;
             asio::steady_timer timer_;
             std::queue<std::shared_ptr<operation>> accept_ops_;
             std::unordered_map<udp::endpoint, connection_ptr> connections_;
@@ -839,7 +839,6 @@ namespace moon
             data.clear();
             data.resize(16, 0);
             co_await sock.async_receive(asio::buffer(data), asio::use_awaitable);
-            auto ep = sock.local_endpoint();
             uint32_t conv;
             memcpy(&conv, data.data(), sizeof(conv));
             auto conn = std::make_shared<connection>(new udp::socket(std::move(sock)), conv, endpoint, false);

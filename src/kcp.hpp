@@ -41,6 +41,7 @@ namespace moon
             vsprintf(buffer, format, args);
             printf("[%s] %s\n", tmbuffer, buffer);
             va_end(args);
+            fflush(stdout);
         }
 
         constexpr uint8_t packet_handshark = 1;

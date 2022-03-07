@@ -3,7 +3,7 @@ Modern use kcp with asio, support async_accept, async_connect, async_read, async
 
 # Example
 
-see `tcp_over_kcp.cpp`, a demo can convert tcp stream data to kcp packet or convert kcp packet data to tcp stream data. it worked in 2 modes:
+see `src/tcp_over_kcp.cpp`, a demo can convert tcp stream data to kcp packet or convert kcp packet data to tcp stream data. it worked in 2 modes:
 - tcp2kcp: listen tcp endpoint and read data then use kcp send it.
 - kcp2tcp: listen udp endpoint and read data then use tcp send it.
 

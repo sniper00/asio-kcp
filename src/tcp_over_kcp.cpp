@@ -81,8 +81,7 @@ asio::awaitable<void> tcp2kcp(std::shared_ptr<tcp::socket> tcp_socket, moon::kcp
     }
 }
 
-template<typename KcpSocket>
-asio::awaitable<void> start_pipe(KcpSocket kcp_socket)
+asio::awaitable<void> start_pipe(moon::kcp::connection_ptr kcp_socket)
 {
     try
     {
@@ -218,6 +217,10 @@ int main(int argc, char** argv)
     try
     {
         asio::io_context ioctx;
+
+        asio::signal_set signals(ioctx, SIGINT, SIGTERM);
+        signals.async_wait([&](auto, auto) { ioctx.stop(); });
+
         {
             auto [host, port] = moon::kcp::parse_host_port(local, 0);
             asio::ip::tcp::resolver resolver(ioctx.get_executor());

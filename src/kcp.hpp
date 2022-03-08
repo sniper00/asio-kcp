@@ -13,9 +13,13 @@ namespace moon
 {
     namespace kcp
     {
-        constexpr uint8_t close_key[32] = { 87, 51, 90, 138, 98, 219, 143, 116, 18, 21, 204, 102, 221, 3, 139, 89, 217, 225, 60, 125, 27, 82, 146, 49, 196, 39, 80, 40, 80, 236, 104, 67 };
-
         constexpr time_t timeout_duration = 30 * 1000;//millseconds
+
+        constexpr uint8_t packet_handshark = 1;
+        constexpr uint8_t packet_keepalive = 2;
+        constexpr uint8_t packet_data = 3;
+        constexpr uint8_t packet_disconnect = 4;
+        constexpr uint8_t packet_type_max = 5;
 
         static std::tm* localtime(std::time_t* t, std::tm* result)
         {
@@ -44,11 +48,6 @@ namespace moon
             fflush(stdout);
         }
 
-        constexpr uint8_t packet_handshark = 1;
-        constexpr uint8_t packet_keepalive = 2;
-        constexpr uint8_t packet_data = 3;
-        constexpr uint8_t packet_disconnect = 4;
-        constexpr uint8_t packet_type_max = 5;
 
         using asio::ip::udp;
 
@@ -207,18 +206,59 @@ namespace moon
             std::unique_ptr<ikcpcb, kcp_obj_deleter> obj_;
             std::unique_ptr<asio::steady_timer> timer_;
             std::shared_ptr<operation> read_op_;
-            asio::streambuf read_buffer_;
             std::vector<static_buffer*> pool_;
 
             template <typename Handler, typename MutableBuffer>
+            class read_some_op :public operation
+            {
+            public:
+                read_some_op(Handler&& handler, const MutableBuffer& buffer)
+                    :operation(&read_some_op::do_complete)
+                    , handler_(std::move(handler))
+                    , buffer_(buffer)
+                {
+                    sizeof(connection);
+                }
+
+                static bool do_complete(void* user, operation* base, const asio::error_code& ec, std::size_t)
+                {
+                    read_some_op* op(static_cast<read_some_op*>(base));
+                    if (ec)
+                    {
+                        op->handler_(ec, 0);
+                        return true;
+                    }
+                    else
+                    {
+                        connection* c = static_cast<connection*>(user);
+                        int n = ikcp_recv(c->obj_.get(), reinterpret_cast<char*>(op->buffer_.data()), static_cast<int>(op->buffer_.size()));
+                        if (n > 0)
+                        {
+                            op->handler_(ec, n);
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+
+                size_t buffer_size() const
+                {
+                    return buffer_.size();
+                }
+            private:
+                Handler handler_;
+                const MutableBuffer& buffer_;
+            };
+
+            template <typename Handler, typename StreamBuffer>
             class read_op :public operation
             {
             public:
-                read_op(Handler&& handler, const MutableBuffer& buffer, bool some)
+                read_op(Handler&& handler, StreamBuffer& buffer, size_t need)
                     :operation(&read_op::do_complete)
                     , handler_(std::move(handler))
                     , buffer_(buffer)
-                    , some_(some)
+                    , need_(need)
                 {
                 }
 
@@ -233,19 +273,23 @@ namespace moon
                     else
                     {
                         connection* c = static_cast<connection*>(user);
-                        int n = ikcp_peeksize(c->obj_.get());
-                        if (n > 0)
+                        while (true)
                         {
-                            auto buffer = c->read_buffer_.prepare(n);
-                            ikcp_recv(c->obj_.get(), reinterpret_cast<char*>(buffer.data()), n);
-                            c->read_buffer_.commit(n);
+                            auto buffer = op->buffer_.prepare(2048);
+                            int n = ikcp_recv(c->obj_.get(), reinterpret_cast<char*>(buffer.data()), 2048);
+                            if (n > 0)
+                            {
+                                op->buffer_.commit(n);
+                            }
+                            else
+                            {
+                                break;
+                            }
                         }
-                        size_t need = (op->some_?std::min(op->buffer_.size(), c->read_buffer_.size()) : op->buffer_.size());
-                        if (c->read_buffer_.size() >= need)
+
+                        if (op->buffer_.size() >= op->need_)
                         {
-                            asio::buffer_copy(op->buffer_, c->read_buffer_.data(), need);
-                            c->read_buffer_.consume(need);
-                            op->handler_(ec, need);
+                            op->handler_(ec, op->need_);
                             return true;
                         }
                         return false;
@@ -258,10 +302,11 @@ namespace moon
                 }
             private:
                 Handler handler_;
-                const MutableBuffer& buffer_;
-                bool some_ = false;
+                StreamBuffer& buffer_;
+                size_t need_;
             };
 
+            template<bool some>
             class initiate_async_read
             {
             public:
@@ -277,8 +322,8 @@ namespace moon
                     return self_->get_executor();
                 }
 
-                template<typename MutableBuffer, typename ReadHandler>
-                void operator()(ReadHandler&& handler, const MutableBuffer& buffer, bool some) const
+                template<typename ReadHandler, typename Buffer>
+                void operator()(ReadHandler&& handler, Buffer&& buffer, size_t need) const
                 {
                     if (nullptr != self_->read_op_ || self_->closed())
                     {
@@ -292,14 +337,21 @@ namespace moon
                     }
                     else
                     {
-                        using op_t = read_op<std::decay_t<ReadHandler>, std::decay_t<MutableBuffer>>;
-                        size_t need = buffer.size();
-                        self_->read_op_ = std::make_unique<op_t>(std::forward<ReadHandler>(handler), buffer, some);
-                        if (self_->read_buffer_.size() >= need)
+                        if constexpr(some)
                         {
-                            asio::post([self_ = self_]() {
-                                self_->check_read_op();
-                                });
+                            using op_t = read_some_op<std::decay_t<ReadHandler>, std::decay_t<Buffer>>;
+                            self_->read_op_ = std::make_unique<op_t>(std::forward<ReadHandler>(handler), buffer);
+                        }
+                        else
+                        {
+                            using op_t = read_op<std::decay_t<ReadHandler>, std::decay_t<Buffer>>;
+                            self_->read_op_ = std::make_unique<op_t>(std::forward<ReadHandler>(handler), buffer, need);
+                            if (buffer.size() >= need)
+                            {
+                                asio::post(get_executor(), [self_ = self_]() {
+                                    self_->check_read_op();
+                                    });
+                            }
                         }
                     }
                 }
@@ -410,10 +462,6 @@ namespace moon
 
             time_t update(time_t now)
             {
-                if (state_ == state::opened)
-                {
-                    check_read_op();
-                }
                 if (obj_ != nullptr && next_tick_ <= now)
                 {
                     ikcp_update(obj_.get(), (IUINT32)now);
@@ -496,18 +544,26 @@ namespace moon
                 return sock_->get_executor();
             }
 
-            template<typename MutableBuffer,typename Handler>
-            auto async_read(const MutableBuffer& buffer, Handler&& handler)
+            /*
+            * Start an asynchronous operation to read data into a dynamic buffer sequence,
+            * until it's size() >=size.
+            */
+            template<typename Allocator, typename ReadHandler>
+            auto async_read(asio::basic_streambuf<Allocator>& b, size_t size, ReadHandler&& handler)
             {
-                return asio::async_initiate<Handler, void(const std::error_code&, size_t)>(
-                    initiate_async_read(this), handler, buffer, false);
+                return asio::async_initiate<ReadHandler, void(asio::error_code, std::size_t)>(
+                    initiate_async_read<false>(this), handler, asio::basic_streambuf_ref(b), size);
             }
 
-            template<typename MutableBuffer, typename Handler>
-            auto async_read_some(const MutableBuffer& buffer, Handler&& handler)
+            /* This function is used to asynchronously receive data from kcp. The function call always returns immediately.
+            *
+            *  Buffer size 2048 is ok.
+            */
+            template<typename MutableBuffer, typename ReadHandler>
+            auto async_read_some(const MutableBuffer& buffer, ReadHandler&& handler)
             {
-                return asio::async_initiate<Handler, void(const std::error_code&, size_t)>(
-                    initiate_async_read(this), handler, buffer, true);
+                return asio::async_initiate<ReadHandler, void(const std::error_code&, size_t)>(
+                    initiate_async_read<true>(this), handler, buffer, 0);
             }
 
             bool async_write(const char* data, size_t len)
@@ -582,8 +638,8 @@ namespace moon
                 state_ = state::closed;
                 ikcp_flush(obj_.get());
                 check_read_op(ec);
-                std::string key{(char*)close_key, 32};
-                raw_send(key.data(), key.size(), packet_disconnect);
+                char addon[32] = { 0 };
+                raw_send(addon, sizeof(addon), packet_disconnect);
                 if (!isserver_)
                 {
                     asio::error_code ignore;

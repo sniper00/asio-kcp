@@ -217,7 +217,7 @@ namespace moon
                     , handler_(std::move(handler))
                     , buffer_(buffer)
                 {
-                    sizeof(connection);
+
                 }
 
                 static bool do_complete(void* user, operation* base, const asio::error_code& ec, std::size_t)

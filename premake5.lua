@@ -57,6 +57,7 @@ project "tcp_over_kcp"
     defines {
         "ASIO_STANDALONE" ,
         "ASIO_NO_DEPRECATED",
+        --"ASIO_ENABLE_HANDLER_TRACKING"
     }
     links{"kcp"}
     filter { "system:windows" }
@@ -64,10 +65,9 @@ project "tcp_over_kcp"
         defines {"_WIN32_WINNT=0x0601"}
         buildoptions { "/await" }
     filter {"system:linux"}
-        buildoptions {"-std=c++20", "-stdlib=libc++"}
-        links{"pthread", "c++", "c++abi"}
+        buildoptions {"-std=c++20"}
+        links{"pthread"}
         linkoptions {"-static-libstdc++ -static-libgcc","-Wl,-rpath=./","-Wl,--as-needed"}
-        --linkoptions {"-Wl,-rpath=./","-Wl,--as-needed"}
     filter "configurations:Debug"
         targetsuffix "-d"
     filter{"configurations:*"}

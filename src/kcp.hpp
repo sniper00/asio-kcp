@@ -14,12 +14,14 @@ namespace moon
     namespace kcp
     {
         constexpr time_t timeout_duration = 30 * 1000;//millseconds
+        constexpr time_t update_interval = 5;//millseconds
 
         constexpr uint8_t packet_handshark = 1;
         constexpr uint8_t packet_keepalive = 2;
         constexpr uint8_t packet_data = 3;
         constexpr uint8_t packet_disconnect = 4;
         constexpr uint8_t packet_type_max = 5;
+        constexpr size_t idle_send_packet_count = 128;
 
         static std::tm* localtime(std::time_t* t, std::tm* result)
         {
@@ -206,6 +208,7 @@ namespace moon
             std::unique_ptr<ikcpcb, kcp_obj_deleter> obj_;
             std::unique_ptr<asio::steady_timer> timer_;
             std::shared_ptr<operation> read_op_;
+            std::shared_ptr<operation> write_op_;
             std::vector<static_buffer*> pool_;
 
             template <typename Handler, typename MutableBuffer>
@@ -360,6 +363,103 @@ namespace moon
                 connection* self_;
             };
 
+
+            template <typename Handler>
+            class write_op :public operation
+            {
+            public:
+                write_op(Handler&& handler)
+                    :operation(&write_op::do_complete)
+                    , handler_(std::move(handler))
+                {
+                }
+
+                static bool do_complete(void* user, operation* base, const asio::error_code& ec, std::size_t)
+                {
+                    write_op* op(static_cast<write_op*>(base));
+                    if (ec)
+                    {
+                        op->handler_(ec, 0);
+                        return true;
+                    }
+                    else
+                    {
+                        connection* c = static_cast<connection*>(user);
+                        if (ikcp_waitsnd(c->obj_.get()) <= idle_send_packet_count)
+                        {
+                            op->handler_(ec, 0);
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+            private:
+                Handler handler_;
+            };
+
+            class initiate_async_write
+            {
+            public:
+                typedef  asio::any_io_executor executor_type;
+
+                explicit initiate_async_write(connection* self)
+                    : self_(self)
+                {
+                }
+
+                executor_type get_executor() const
+                {
+                    return self_->get_executor();
+                }
+
+                template<typename WriteHandler, typename Buffer>
+                void operator()(WriteHandler&& handler, Buffer&& buffer) const
+                {
+                    if (nullptr != self_->write_op_ || self_->closed())
+                    {
+                        auto executor = asio::get_associated_executor(
+                            handler, self_->get_executor());
+
+                        asio::post(
+                            asio::bind_executor(executor,
+                                std::bind(std::forward<decltype(handler)>(
+                                    handler), self_->closed() ? asio::error::operation_aborted : asio::error::in_progress, 0)));
+                    }
+                    else
+                    {
+                        self_->next_tick_ = 0;
+                        if (ikcp_send(self_->obj_.get(), (const char*)buffer.data(), static_cast<int>(buffer.size())) < 0)
+                        {
+                            auto executor = asio::get_associated_executor(
+                                handler, self_->get_executor());
+                            asio::post(
+                                asio::bind_executor(executor,
+                                    std::bind(std::forward<decltype(handler)>(
+                                        handler), asio::error::message_size, 0)));
+                            return;
+                        }
+
+                        if (ikcp_waitsnd(self_->obj_.get()) <= idle_send_packet_count)
+                        {
+                            auto executor = asio::get_associated_executor(
+                                handler, self_->get_executor());
+                            asio::post(
+                                asio::bind_executor(executor,
+                                    std::bind(std::forward<decltype(handler)>(
+                                        handler), asio::error_code{}, 0)));
+                        }
+                        else
+                        {
+                            using op_t = write_op<std::decay_t<WriteHandler>>;
+                            self_->write_op_ = std::make_unique<op_t>(std::forward<WriteHandler>(handler));
+                        }
+                    }
+                }
+
+            private:
+                connection* self_;
+            };
+
             void init_kcp_context()
             {
                 obj_ = std::unique_ptr<ikcpcb, kcp_obj_deleter>{ ikcp_create(conv_, this) };
@@ -399,6 +499,19 @@ namespace moon
                     if (!op->complete(this, ec, 0))
                     {
                         read_op_ = std::move(op);
+                    }
+                }
+                check_write_op(ec);
+            }
+
+            void check_write_op(asio::error_code ec = asio::error_code{})
+            {
+                if (nullptr != write_op_)
+                {
+                    auto op = std::move(write_op_);
+                    if (!op->complete(this, ec, 0))
+                    {
+                        write_op_ = std::move(op);
                     }
                 }
             }
@@ -443,7 +556,7 @@ namespace moon
             {
                 if (nullptr == timer_)
                     timer_ = std::make_unique<asio::steady_timer>(get_executor());
-                timer_->expires_after(std::chrono::milliseconds(5));
+                timer_->expires_after(std::chrono::milliseconds(update_interval));
                 timer_->async_wait([this, self = shared_from_this()](const asio::error_code& e) {
                     if (e)
                     {
@@ -466,6 +579,8 @@ namespace moon
                 {
                     ikcp_update(obj_.get(), (IUINT32)now);
                     next_tick_ = ikcp_check(obj_.get(), (IUINT32)now);
+                    if(next_tick_- now < update_interval)
+                        ikcp_flush(obj_.get());
                 }
                 return now_tick_;
             }
@@ -566,12 +681,11 @@ namespace moon
                     initiate_async_read<true>(this), handler, buffer, 0);
             }
 
-            bool async_write(const char* data, size_t len)
+            template<typename ConstBuffer, typename WriteHandler>
+            auto async_write(const ConstBuffer& buffer, WriteHandler&& handler)
             {
-                if (nullptr == obj_)
-                    return false;
-                next_tick_ = 0;
-                return ikcp_send(obj_.get(), data, static_cast<int>(len)) >= 0;
+                return asio::async_initiate<WriteHandler, void(const std::error_code&, size_t)>(
+                    initiate_async_write(this), handler, buffer);
             }
 
             bool raw_send(const char* data, size_t size, uint8_t packet_type = packet_data)

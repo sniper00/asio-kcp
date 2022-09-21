@@ -31,13 +31,15 @@ static config cfg;
 
 constexpr uint8_t connect_key[32] = { 49, 194, 61, 231, 161, 216, 31, 60, 230, 26, 13, 25, 211, 185, 93, 67, 118, 28, 49, 220, 184, 71, 20, 228, 4, 24, 36, 205, 222, 99, 240, 152 };
 
+constexpr size_t buffer_size = 8192;
+
 std::string magic = std::string{(char*)connect_key, 32};
 
 asio::awaitable<void> kcp2tcp(moon::kcp::connection_ptr kcp_socket, std::shared_ptr< tcp::socket> tcp_socket)
 {
     try
     {
-        std::array<char, 2048> buffer;
+        std::array<char, buffer_size> buffer;
         while (true)
         {
             size_t n = co_await kcp_socket->async_read_some(asio::buffer(buffer), asio::use_awaitable);
@@ -61,11 +63,11 @@ asio::awaitable<void> tcp2kcp(std::shared_ptr<tcp::socket> tcp_socket, moon::kcp
 {
     try
     {
-        std::array<char, 2048> buffer;
+        std::array<char, buffer_size> buffer;
         while (true)
         {
             std::size_t n = co_await tcp_socket->async_read_some(asio::buffer(buffer), asio::use_awaitable);
-            kcp_socket->async_write(buffer.data(), n);
+            co_await kcp_socket->async_write(asio::const_buffer(buffer.data(), n), asio::use_awaitable);
         }
     }
     catch (const std::exception& ex)

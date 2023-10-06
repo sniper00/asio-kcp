@@ -6,22 +6,40 @@
 #include <cstdarg>
 #include <queue>
 #include <ctime>
+#include <chrono>
 #include <asio.hpp>
+#include <asio/as_tuple.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
 #include "kcp/ikcp.h"
+#include "error.hpp"
 
 namespace moon
 {
+    using asio::as_tuple_t;
+    using asio::awaitable;
+    using asio::co_spawn;
+    using asio::use_awaitable_t;
+    using namespace asio::experimental::awaitable_operators;
+
+
+    using std::chrono::steady_clock;
+    using namespace std::literals::chrono_literals;
+    using namespace std::string_view_literals;
+
     namespace kcp
     {
         constexpr time_t timeout_duration = 30 * 1000;//millseconds
         constexpr time_t update_interval = 5;//millseconds
 
-        constexpr uint8_t packet_handshark = 1;
-        constexpr uint8_t packet_keepalive = 2;
-        constexpr uint8_t packet_data = 3;
-        constexpr uint8_t packet_disconnect = 4;
-        constexpr uint8_t packet_type_max = 5;
+        constexpr uint8_t opcode_handshark = 1;
+        constexpr uint8_t opcode_handshark_response = 2;
+        constexpr uint8_t opcode_keepalive = 3;
+        constexpr uint8_t opcode_data = 4;
+        constexpr uint8_t opcode_disconnect = 5;
+        constexpr uint8_t opcode_max = 6;
         constexpr size_t idle_send_packet_count = 128;
+
+        using asio::ip::udp;
 
         static std::tm* localtime(std::time_t* t, std::tm* result)
         {
@@ -49,9 +67,6 @@ namespace moon
             va_end(args);
             fflush(stdout);
         }
-
-
-        using asio::ip::udp;
 
         inline std::pair<std::string, unsigned short> parse_host_port(const std::string& host_port, unsigned short default_port) {
             std::string host, port;
@@ -83,6 +98,18 @@ namespace moon
             }
         }
 
+        template<typename EndPoint>
+        static std::string address(const EndPoint& endpoint)
+        {
+            std::string address;
+            asio::error_code code;
+
+            address.append(endpoint.address().to_string());
+            address.append(":");
+            address.append(std::to_string(endpoint.port()));
+            return address;
+        }
+
         inline time_t clock()
         {
             using time_point = std::chrono::time_point<std::chrono::steady_clock>;
@@ -91,32 +118,11 @@ namespace moon
             return diff.count();
         }
 
-        class operation
-        {
-        public:
-            bool complete(void* owner, const std::error_code& ec,std::size_t bytes_transferred)
-            {
-                return func_(owner, this, ec, bytes_transferred);
-            }
-        protected:
-            using func_type = bool(*)(void*, operation*, const std::error_code&, std::size_t);
-            operation(func_type func):func_(func){}
-            ~operation(){}
-        private:
-            func_type func_;
-        };
-
         class static_buffer
         {
             size_t size_ = 0;
-            void* user_ = nullptr;
             std::array<char, 2048> data_{};
         public:
-            static_buffer(void* user)
-                :user_(user)
-            {
-            }
-
             char* data()
             {
                 return data_.data();
@@ -157,10 +163,77 @@ namespace moon
                 return std::string{ data_.data(), size_ };
             }
 
-            void* get_user() const
+            void write(uint8_t opcode, const char* data, size_t size)
             {
-                return user_;
+                assert(size+1 < data_.size());
+                data_[0] = opcode;
+                size_ = 1 + size;
+                memcpy(data_.data() + 1, data, size);
             }
+        };
+
+        class static_buffer_pool
+        {
+            struct container
+            {
+                ~container()
+                {
+                    for (auto p : pool)
+                    {
+                        delete p;
+                    }
+                }
+                std::vector<static_buffer*> pool;
+            };
+
+            struct static_buffer_deleter {
+                void operator()(static_buffer* p)
+                {
+                    if (container_.pool.size() < 1024)
+                    {
+                        container_.pool.push_back(p);
+                    }
+                    else
+                    {
+                        delete p;
+                    }
+                }
+            };
+        public:
+            using static_buffer_ptr_t = std::unique_ptr<static_buffer, static_buffer_deleter>;
+
+            static static_buffer_ptr_t make()
+            {
+                static_buffer* buffer;
+                if (!container_.pool.empty())
+                {
+                    buffer = container_.pool.back();
+                    container_.pool.pop_back();
+                    buffer->set_size(0);
+                }
+                else
+                {
+                    buffer = new static_buffer{};
+                }
+                return static_buffer_ptr_t{ buffer };
+            }
+        private:
+            inline static thread_local container container_{};
+        };
+
+        class operation
+        {
+        public:
+            bool complete(void* owner, const std::error_code& ec,std::size_t bytes_transferred)
+            {
+                return func_(owner, this, ec, bytes_transferred);
+            }
+        protected:
+            using func_type = bool(*)(void*, operation*, const std::error_code&, std::size_t);
+            operation(func_type func):func_(func){}
+            ~operation(){}
+        private:
+            func_type func_;
         };
 
         //--------------------------------connection--------------------------------------
@@ -173,22 +246,7 @@ namespace moon
 
             using kcp_context_ptr = std::unique_ptr<ikcpcb, kcp_obj_deleter>;
 
-            struct static_buffer_deleter {
-                void operator()(static_buffer* p)
-                {
-                    connection* user = static_cast<connection*>(p->get_user());
-                    if (user->pool_.size() < 32)
-                    {
-                        user->pool_.push_back(p);
-                    }
-                    else
-                    {
-                        delete p;
-                    }
-                }
-            };
-
-            using static_buffer_ptr = std::unique_ptr<static_buffer, static_buffer_deleter>;
+            using static_buffer_ptr_t = static_buffer_pool::static_buffer_ptr_t;
 
         private:
             enum class state
@@ -203,13 +261,12 @@ namespace moon
             uint32_t conv_ = 0;
             time_t next_tick_ = 0;
             time_t now_tick_ = 0;
-            udp::socket* sock_ = nullptr;
+            udp::socket* sock_;
             udp::endpoint endpoint_;
             std::unique_ptr<ikcpcb, kcp_obj_deleter> obj_;
             std::unique_ptr<asio::steady_timer> timer_;
             std::shared_ptr<operation> read_op_;
             std::shared_ptr<operation> write_op_;
-            std::vector<static_buffer*> pool_;
 
             template <typename Handler, typename MutableBuffer>
             class read_some_op :public operation
@@ -279,7 +336,7 @@ namespace moon
                         while (true)
                         {
                             auto buffer = op->buffer_.prepare(2048);
-                            int n = ikcp_recv(c->obj_.get(), reinterpret_cast<char*>(buffer.data()), 2048);
+                            int n = ikcp_recv(c->obj_.get(), reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()));
                             if (n > 0)
                             {
                                 op->buffer_.commit(n);
@@ -344,17 +401,15 @@ namespace moon
                         {
                             using op_t = read_some_op<std::decay_t<ReadHandler>, std::decay_t<Buffer>>;
                             self_->read_op_ = std::make_unique<op_t>(std::forward<ReadHandler>(handler), buffer);
+                            asio::post(get_executor(), [self_ = self_]()
+                                       { self_->check_read_op(); });
                         }
                         else
                         {
                             using op_t = read_op<std::decay_t<ReadHandler>, std::decay_t<Buffer>>;
                             self_->read_op_ = std::make_unique<op_t>(std::forward<ReadHandler>(handler), buffer, need);
-                            if (buffer.size() >= need)
-                            {
-                                asio::post(get_executor(), [self_ = self_]() {
-                                    self_->check_read_op();
-                                    });
-                            }
+                            asio::post(get_executor(), [self_ = self_]()
+                                       { self_->check_read_op(); });
                         }
                     }
                 }
@@ -470,32 +525,16 @@ namespace moon
                 obj_->stream = 1;
                 ikcp_setoutput(obj_.get(), [](const char* buf, int len, ikcpcb*, void* user) {
                     connection* conn = (connection*)user;
-                    conn->raw_send(buf, len);
+                    conn->raw_send(buf, len, opcode_data);
                     return 0;
                     });
             }
 
-            static_buffer_ptr create_buffer()
-            {
-                static_buffer* buffer;
-                if (!pool_.empty())
-                {
-                    buffer = pool_.back();
-                    pool_.pop_back();
-                    buffer->set_size(0);
-                }
-                else
-                {
-                    buffer = new static_buffer{ this };
-                }
-                return static_buffer_ptr{ buffer };
-            }
-
             void check_read_op(asio::error_code ec = asio::error_code{})
             {
-                if (nullptr != read_op_)
+                if (nullptr != read_op_ && nullptr!=obj_)
                 {
-                    auto op = std::move(read_op_);
+                    std::shared_ptr<operation> op = std::move(read_op_);
                     if (!op->complete(this, ec, 0))
                     {
                         read_op_ = std::move(op);
@@ -508,7 +547,7 @@ namespace moon
             {
                 if (nullptr != write_op_)
                 {
-                    auto op = std::move(write_op_);
+                    std::shared_ptr<operation> op = std::move(write_op_);
                     if (!op->complete(this, ec, 0))
                     {
                         write_op_ = std::move(op);
@@ -518,33 +557,36 @@ namespace moon
 
             void on_receive(const char* data, size_t size, time_t t)
             {
+                if (size < 24)//kcp header
+                    return;
                 if(state_ == state::idle)
                     state_ = state::opened;
 
                 now_tick_ = t;
 
-                uint8_t opcode = static_cast<uint8_t>(data[0]) & 0xF;
+                uint8_t opcode = data[0];
+                data = data + 1;
+                size = size - 1;
+
+                //printf("on_receive opcode %d\n", int(opcode));
+
                 switch (opcode)
                 {
-                case packet_disconnect:
+                case opcode_data:
                 {
-                    if(nullptr != obj_)
-                        close(asio::error::make_error_code(asio::error::eof));
-                    return;
-                }
-                case packet_keepalive:
-                {
-                    return;
-                }
-                case packet_data:
-                {
-                    if (nullptr == obj_)
-                    {
-                        init_kcp_context();
-                    }
-                    ikcp_input(obj_.get(), data +1, (long)(size - 1));
+                    ikcp_input(obj_.get(), data, (long)size);
                     next_tick_ = 0;
                     check_read_op();
+                    return;
+                }
+                case opcode_keepalive:
+                {
+                    return;
+                }
+                case opcode_disconnect:
+                {
+                    if (nullptr != obj_)
+                        close(asio::error::make_error_code(asio::error::eof));
                     return;
                 }
                 default:
@@ -585,9 +627,8 @@ namespace moon
                 return now_tick_;
             }
 
-            void do_receive(static_buffer_ptr buffer)
+            void do_receive(static_buffer_ptr_t buffer)
             {
-                assert(!isserver_);
                 if (state_ == state::closed)
                     return;
                 buffer->set_size(buffer->max_size());
@@ -603,54 +644,41 @@ namespace moon
                     }
                     else
                     {
-                        if (size > 24)
-                        {
-                            on_receive(buffer->data(), size, clock());
-                        }
+                        on_receive(buffer->data(), size, clock());
                         do_receive(std::move(buffer));
                     }
                 });
             }
         public:
-            connection(udp::socket* sock, uint32_t conv, udp::endpoint& endpoint, bool isserver = true)
+            connection(udp::socket* sock, uint32_t conv, udp::endpoint& endpoint, bool isserver)
                 : isserver_(isserver)
                 , conv_(conv)
                 , now_tick_(clock())
                 , sock_(sock)
                 , endpoint_(std::move(endpoint))
             {
-                assert(sock_);
-                assert(conv_ > 0);
-                if (!isserver)
+                init_kcp_context();
+            }
+
+            void run_client()
+            {
+                if (!isserver_)
                 {
-                    init_kcp_context();
+                    if (state_ == state::idle)
+                    {
+                        state_ = state::opened;
+                        do_receive(static_buffer_pool::make());
+                        start_timer();
+                    }
                 }
             }
 
             virtual ~connection()
             {
                 close(asio::error::operation_aborted);
-                console_log("%s.connection destructer: %u", (isserver_ ? "server": "client" ), conv_);
-                if (!isserver_ && nullptr!= sock_)
-                {
+                console_log("%s.connection destructor: %u", (isserver_ ? "server": "client" ), conv_);
+                if (!isserver_) {
                     delete sock_;
-                    sock_ = nullptr;
-                }
-
-                for (auto p : pool_)
-                {
-                    delete p;
-                }
-                pool_.clear();
-            }
-
-            void start_client()
-            {
-                if (state_ == state::idle)
-                {
-                    state_ = state::opened;
-                    do_receive(create_buffer());
-                    start_timer();
                 }
             }
 
@@ -688,16 +716,13 @@ namespace moon
                     initiate_async_write(this), handler, buffer);
             }
 
-            bool raw_send(const char* data, size_t size, uint8_t packet_type = packet_data)
+            bool raw_send(const char* data, size_t size, uint8_t opcode)
             {
                 assert(size <= 2048);
-                auto buffer = create_buffer();
-                char* p = buffer->data();
-                p[0] = (char)packet_type;
-                memcpy(p + 1, data, size);
-                buffer->set_size(size + 1);
+                auto buffer = static_buffer_pool::make();
+                buffer->write(opcode, data, size);
                 auto const_buffer = buffer->const_buffer();
-                if (packet_type != packet_disconnect)
+                if (opcode != opcode_disconnect)
                 {
                     sock_->async_send_to(
                         const_buffer,
@@ -739,6 +764,10 @@ namespace moon
                 return *sock_;
             }
 
+            auto& endpoint() {
+                return endpoint_;
+            }
+
             void close(asio::error_code ec)
             {
                 if (state_ != state::opened)
@@ -753,7 +782,7 @@ namespace moon
                 ikcp_flush(obj_.get());
                 check_read_op(ec);
                 char addon[32] = { 0 };
-                raw_send(addon, sizeof(addon), packet_disconnect);
+                raw_send(addon, sizeof(addon), opcode_disconnect);
                 if (!isserver_)
                 {
                     asio::error_code ignore;
@@ -798,31 +827,20 @@ namespace moon
                 acceptor* self_;
             };
 
-            class accept_op_ :public operation
-            {
-            public:
-                connection_ptr c;
-            protected:
-                accept_op_(func_type complete_func)
-                    : operation(complete_func)
-                {
-                }
-            };
-
             template <typename Handler>
-            class accept_op :public accept_op_
+            class accept_op :public operation
             {
             public:
                 accept_op(Handler&& handler)
-                    :accept_op_(&accept_op::do_complete)
+                    :operation(&accept_op::do_complete)
                     , handler_(std::move(handler))
                 {
                 }
 
-                static bool do_complete(void*, operation* base, const asio::error_code&, std::size_t /*bytes_transferred*/)
+                static bool do_complete(void* p, operation* base, const asio::error_code&, std::size_t /*bytes_transferred*/)
                 {
                     accept_op* o(static_cast<accept_op*>(base));
-                    o->handler_(o->c);
+                    o->handler_(std::move(*(connection_ptr*)p));
                     return true;
                 }
             private:
@@ -831,20 +849,14 @@ namespace moon
         public:
             acceptor(const executor_type& executor, udp::endpoint endpoint, std::string magic)
                 :magic_(magic)
-                , sock_(executor, endpoint)
                 , timer_(executor)
             {
-                do_receive(std::make_unique<static_buffer>(this));
-                update();
+                asio::co_spawn(executor, do_receive(endpoint), asio::detached);
+                asio::co_spawn(executor, do_update(), asio::detached);
             }
 
             acceptor(const acceptor&) = delete;
-
             acceptor& operator=(const acceptor&) = delete;
-
-            acceptor(acceptor&&) = delete;
-
-            acceptor& operator=(acceptor&&) = delete;
 
             executor_type get_executor()
             {
@@ -858,164 +870,157 @@ namespace moon
                     initiate_async_accept(this), handler);
             }
         private:
-            void update()
+            asio::awaitable<void> do_update()
             {
-                timer_.expires_after(std::chrono::milliseconds(5));
-                timer_.async_wait([this](const asio::error_code& e) {
-                    if (e)
-                    {
-                        return;
-                    }
-
-                    now_ = clock();
-                    for (auto iter = connections_.begin(); iter != connections_.end();)
-                    {
-                        auto lastrecvtime = iter->second->update(now_);
-                        if (iter->second->closed() || (now_ - lastrecvtime) > timeout_duration)
-                        {
-                            used_conv_.erase(iter->second->get_conv());
-                            iter->second->close(iter->second->closed()?asio::error::operation_aborted:asio::error::timed_out);
-                            iter = connections_.erase(iter);
-                        }
-                        else
-                        {
-                            ++iter;
-                        }
-                    }
-                    update();
-                    });
-            }
-
-            uint32_t make_conv()
-            {
-                while (!used_conv_.emplace(++conv_).second) {};
-                return conv_;
-            }
-
-            void do_receive(std::unique_ptr<static_buffer> buffer)
-            {
-                buffer->set_size(buffer->max_size());
-                auto mutable_buffer = asio::buffer(buffer->data(), buffer->size());
-                sock_.async_receive_from(
-                    mutable_buffer,
-                    from_,
-                    [this, buffer = std::move(buffer)](const std::error_code& ec, size_t size) mutable
+                while (true)
                 {
-                    if (ec)
+                    timer_.expires_after(std::chrono::milliseconds(5));
+                    auto [ec]= co_await timer_.async_wait(asio::as_tuple(asio::use_awaitable));
+                    if (!ec)
                     {
-                        //console_log("kcp.acceptor do_receive error: %s", ec.message().data());
-                        do_receive(std::move(buffer));
-                        return;
-                    }
-
-                    do
-                    {
-                        if (size < 24)
-                            break;
-
-                        uint8_t packet_type = buffer->data()[0] & 0xF;
-                        if (packet_type >= packet_type_max)
-                            break;
-
-                        if (packet_type == packet_handshark)
+                        now_ = clock();
+                        for (auto iter = connections_.begin(); iter != connections_.end();)
                         {
-                            if (accept_ops_.empty())
-                                break;
-
-                            if (size - 1 != magic_.size() || magic_ != std::string{ buffer->data()+1, size -1 })
+                            auto lastrecvtime = iter->second->update(now_);
+                            if (iter->second->closed() || (now_ - lastrecvtime) > timeout_duration)
                             {
-                                console_log("acceptor ignore packet: handshark magic not match.");
-                                break;
+                                iter->second->close(iter->second->closed() ? asio::error::operation_aborted : asio::error::timed_out);
+                                iter = connections_.erase(iter);
                             }
-
-                            connection_ptr conn;
-                            if (auto iter = connections_.find(from_); iter != connections_.end())
+                            else
                             {
-                                if (iter->second->idle())
-                                {
-                                    conn = iter->second;
-                                }
-                                else
-                                {
-                                    iter->second->close(asio::error::make_error_code(asio::error::operation_aborted));
-                                    connections_.erase(iter);
-                                }
+                                ++iter;
                             }
+                        }
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
 
-                            if(!conn)
+            asio::awaitable<void> do_receive(udp::endpoint endpoint)
+            {
+                auto executor = co_await asio::this_coro::executor;
+                udp::socket socket{executor, endpoint};
+                udp::endpoint sender_endpoint;
+                std::array<char, 2048> buffer{};
+
+                size_t handshark_size = 1 + magic_.size() + 4;
+                while (true)
+                {
+                    auto [ec, n] = co_await socket.async_receive_from(asio::buffer(buffer.data(), buffer.size()), sender_endpoint, asio::as_tuple(asio::use_awaitable));
+                    if (!ec)
+                    {
+                        uint8_t opcode = buffer[0];
+                        if (opcode >= opcode_max)
+                            continue;
+
+                        if (opcode == opcode_handshark)
+                        {
+                            if (n == handshark_size && std::string_view{buffer.data() + 1, magic_.size()} == magic_)
                             {
-                                conn = std::make_shared<connection>(&sock_, make_conv(), from_, true);
-                                connections_.emplace(from_, conn);
+                                uint32_t conv = 0;
+                                memcpy(&conv, buffer.data() + 1 + magic_.size(), sizeof(uint32_t));
+                                asio::co_spawn(executor, handshark(socket, conv, sender_endpoint), asio::detached);
                             }
-
-                            std::unique_ptr<std::string> response = std::make_unique<std::string>();
-                            uint32_t conv = conn->get_conv();
-                            response->append(reinterpret_cast<const char*>(&conv), sizeof(conv));
-                            auto b = asio::buffer(response->data(), response->size());
-                            sock_.async_send_to(b, from_, [response = std::move(response)](std::error_code, size_t) {});
-
-                            auto op = accept_ops_.front();
-                            accept_ops_.pop();
-                            static_cast<accept_op_*>(op.get())->c = conn;
-                            op->complete(this, std::error_code(), 0);
                         }
                         else
                         {
-                            if (auto iter = connections_.find(from_); iter != connections_.end())
+                            if (auto iter = connections_.find(sender_endpoint); iter != connections_.end())
                             {
-                                iter->second->on_receive(buffer->data(), size, now_);
+                                iter->second->on_receive(buffer.data(), n, now_);
+                            }
+                            else
+                            {
+                                printf("warn: acceptor udp receive from %s, opcode %d \n", address(sender_endpoint).data(), int(opcode));
                             }
                         }
-                    }while (false);
+                    }
+                    else
+                    {
+                        printf("acceptor udp receive from %s, error %s \n", address(sender_endpoint).data(), ec.message().data());
+                    }
+                }
+            }
 
-                    do_receive(std::move(buffer));
-                });
+            asio::awaitable<void> handshark(udp::socket &sock, uint32_t conv, udp::endpoint endpoint)
+            {
+                auto executor = co_await asio::this_coro::executor;
+                connection_ptr c;
+                if (auto iter = connections_.find(endpoint); iter != connections_.end())
+                {
+                    if (iter->second->idle())
+                    {
+                        c = iter->second;
+                    }
+                    else
+                    {
+                        iter->second->close(asio::error::make_error_code(asio::error::operation_aborted));
+                        connections_.erase(iter);
+                    }
+                }
+
+                if (!c)
+                {
+                    c = std::make_shared<connection>(&sock, conv, endpoint, true);
+                    connections_.emplace(endpoint, c);
+                }
+
+                std::unique_ptr<std::string> response = std::make_unique<std::string>();
+                conv = c->get_conv();
+
+                char data[32];
+                memcpy(data, &conv, sizeof(conv));
+                c->raw_send(data, sizeof(conv), opcode_handshark_response);
+
+                std::shared_ptr<operation> op = std::move(accept_ops_.front());
+                accept_ops_.pop();
+                op->complete(&c, std::error_code(), 0);
             }
         private:
             uint32_t conv_ = 0;
             time_t now_ = clock();
             std::string magic_;
-            udp::socket sock_;
-            udp::endpoint from_;
             asio::steady_timer timer_;
             std::queue<std::shared_ptr<operation>> accept_ops_;
             std::unordered_map<udp::endpoint, connection_ptr> connections_;
-            std::unordered_set<uint32_t> used_conv_;
         };
 
         //------------------------------connector------------------------------------
-
         template<typename Executor>
-        inline asio::awaitable<connection_ptr> async_connect(const Executor& executor,  udp::endpoint endpoint, std::string magic, time_t millseconds_timeout)
+        inline asio::awaitable<std::tuple<asio::error_code,  connection_ptr>> async_connect(const Executor& executor,  udp::endpoint endpoint, std::string magic)
         {
+            thread_local static uint32_t conv = 0;
+            ++conv;
             udp::socket sock(executor);
-
-            asio::steady_timer timer{executor};
-            timer.expires_after(std::chrono::milliseconds(millseconds_timeout));
-            timer.async_wait([&sock](const asio::error_code& e) {
-                if (e)
-                {
-                    return;
-                }
-                std::error_code ignore;
-                sock.close(ignore);
-                console_log("async_connect timeout");
-                });
-
-            co_await sock.async_connect(endpoint, asio::use_awaitable);
+            auto [ec1] = co_await sock.async_connect(endpoint, asio::as_tuple(asio::use_awaitable));
+            if (ec1) {
+                co_return std::make_tuple(ec1, connection_ptr{});
+            }
             std::string data;
-            data.push_back((char)packet_handshark);
+            data.push_back((char)opcode_handshark);
             data.append(magic);
-            co_await sock.async_send(asio::buffer(data), asio::use_awaitable);
+            data.append((char*)&conv, 4);
+            auto [ec2, n] = co_await sock.async_send(asio::buffer(data), asio::as_tuple(asio::use_awaitable));
+            if (ec2)
+                co_return std::make_tuple(ec2, connection_ptr{});
             data.clear();
             data.resize(16, 0);
-            co_await sock.async_receive(asio::buffer(data), asio::use_awaitable);
-            uint32_t conv;
-            memcpy(&conv, data.data(), sizeof(conv));
-            auto conn = std::make_shared<connection>(new udp::socket(std::move(sock)), conv, endpoint, false);
-            conn->start_client();
-            timer.cancel();
-            co_return conn;
+            auto [ec3, n2] = co_await sock.async_receive(asio::buffer(data), asio::as_tuple(asio::use_awaitable));
+            if (ec3)
+                co_return std::make_tuple(ec3, connection_ptr{});
+            uint8_t opcode = data[0];
+            if (opcode != opcode_handshark_response)
+            {
+                auto ec4 = moon::kcp::make_error_code(moon::kcp::error::invalid_handshark_response);
+                co_return std::make_tuple(ec4, connection_ptr{});
+            }
+            memcpy(&conv, data.data() + 1, sizeof(conv));
+            connection_ptr c = std::make_shared<connection>(new udp::socket(std::move(sock)), conv, endpoint, false);
+            c->run_client();
+            co_return std::make_tuple(asio::error_code{}, std::move(c));
         }
     }
 }

@@ -1,15 +1,15 @@
 //
-// experimental/impl/append.hpp
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// impl/append.hpp
+// ~~~~~~~~~~~~~~~
 //
-// Copyright (c) 2003-2021 Christopher M. Kohlhoff (chris at kohlhoff dot com)
+// Copyright (c) 2003-2022 Christopher M. Kohlhoff (chris at kohlhoff dot com)
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 
-#ifndef ASIO_IMPL_EXPERIMENTAL_APPEND_HPP
-#define ASIO_IMPL_EXPERIMENTAL_APPEND_HPP
+#ifndef ASIO_IMPL_APPEND_HPP
+#define ASIO_IMPL_APPEND_HPP
 
 #if defined(_MSC_VER) && (_MSC_VER >= 1200)
 # pragma once
@@ -23,15 +23,15 @@
 #include "asio/detail/handler_cont_helpers.hpp"
 #include "asio/detail/handler_invoke_helpers.hpp"
 #include "asio/detail/type_traits.hpp"
+#include "asio/detail/utility.hpp"
 #include "asio/detail/variadic_templates.hpp"
 
 #include "asio/detail/push_options.hpp"
 
 namespace asio {
-namespace experimental {
 namespace detail {
 
-// Class to adapt a append_t as a completion handler.
+// Class to adapt an append_t as a completion handler.
 template <typename Handler, typename... Values>
 class append_handler
 {
@@ -49,12 +49,12 @@ public:
   void operator()(ASIO_MOVE_ARG(Args)... args)
   {
     this->invoke(
-        std::make_index_sequence<sizeof...(Values)>{},
+        index_sequence_for<Values...>{},
         ASIO_MOVE_CAST(Args)(args)...);
   }
 
   template <std::size_t... I, typename... Args>
-  void invoke(std::index_sequence<I...>, ASIO_MOVE_ARG(Args)... args)
+  void invoke(index_sequence<I...>, ASIO_MOVE_ARG(Args)... args)
   {
     ASIO_MOVE_OR_LVALUE(Handler)(handler_)(
         ASIO_MOVE_CAST(Args)(args)...,
@@ -97,7 +97,7 @@ inline bool asio_handler_is_continuation(
     append_handler<Handler>* this_handler)
 {
   return asio_handler_cont_helpers::is_continuation(
-        this_handler->handler_);
+      this_handler->handler_);
 }
 
 template <typename Function, typename Handler>
@@ -134,18 +134,17 @@ struct append_signature<R(Args...), Values...>
 };
 
 } // namespace detail
-} // namespace experimental
 
 #if !defined(GENERATING_DOCUMENTATION)
 
 template <typename CompletionToken, typename... Values, typename Signature>
 struct async_result<
-    experimental::append_t<CompletionToken, Values...>, Signature>
+    append_t<CompletionToken, Values...>, Signature>
   : async_result<CompletionToken,
-      typename experimental::detail::append_signature<
+      typename detail::append_signature<
         Signature, Values...>::type>
 {
-  typedef typename experimental::detail::append_signature<
+  typedef typename detail::append_signature<
       Signature, Values...>::type signature;
 
   template <typename Initiation>
@@ -163,7 +162,7 @@ struct async_result<
         ASIO_MOVE_ARG(Args)... args)
     {
       ASIO_MOVE_CAST(Initiation)(initiation_)(
-          experimental::detail::append_handler<
+          detail::append_handler<
             typename decay<Handler>::type, Values...>(
               ASIO_MOVE_CAST(Handler)(handler),
               ASIO_MOVE_CAST(std::tuple<Values...>)(values)),
@@ -195,14 +194,23 @@ struct async_result<
 };
 
 template <template <typename, typename> class Associator,
-    typename Handler, typename DefaultCandidate>
+    typename Handler, typename... Values, typename DefaultCandidate>
 struct associator<Associator,
-    experimental::detail::append_handler<Handler>, DefaultCandidate>
+    detail::append_handler<Handler, Values...>, DefaultCandidate>
   : Associator<Handler, DefaultCandidate>
 {
-  static typename Associator<Handler, DefaultCandidate>::type get(
-      const experimental::detail::append_handler<Handler>& h,
-      const DefaultCandidate& c = DefaultCandidate()) ASIO_NOEXCEPT
+  static typename Associator<Handler, DefaultCandidate>::type
+  get(const detail::append_handler<Handler, Values...>& h) ASIO_NOEXCEPT
+  {
+    return Associator<Handler, DefaultCandidate>::get(h.handler_);
+  }
+
+  static ASIO_AUTO_RETURN_TYPE_PREFIX2(
+      typename Associator<Handler, DefaultCandidate>::type)
+  get(const detail::append_handler<Handler, Values...>& h,
+      const DefaultCandidate& c) ASIO_NOEXCEPT
+    ASIO_AUTO_RETURN_TYPE_SUFFIX((
+      Associator<Handler, DefaultCandidate>::get(h.handler_, c)))
   {
     return Associator<Handler, DefaultCandidate>::get(h.handler_, c);
   }
@@ -214,4 +222,4 @@ struct associator<Associator,
 
 #include "asio/detail/pop_options.hpp"
 
-#endif // ASIO_IMPL_EXPERIMENTAL_APPEND_HPP
+#endif // ASIO_IMPL_APPEND_HPP

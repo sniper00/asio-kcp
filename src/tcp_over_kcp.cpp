@@ -3,21 +3,7 @@
 
 using asio::ip::tcp;
 using asio::ip::udp;
-
-template<typename Socket>
-static std::string address(Socket& socket)
-{
-    std::string address;
-    asio::error_code code;
-    auto endpoint = socket.remote_endpoint(code);
-    if (!code)
-    {
-        address.append(endpoint.address().to_string());
-        address.append(":");
-        address.append(std::to_string(endpoint.port()));
-    }
-    return address;
-}
+using namespace moon;
 
 struct config
 {
@@ -34,6 +20,13 @@ constexpr uint8_t connect_key[32] = { 49, 194, 61, 231, 161, 216, 31, 60, 230, 2
 constexpr size_t buffer_size = 8192;
 
 std::string magic = std::string{(char*)connect_key, 32};
+
+static asio::awaitable<void> timeout(steady_clock::duration duration)
+{
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    timer.expires_after(duration);
+    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+}
 
 asio::awaitable<void> kcp2tcp(moon::kcp::connection_ptr kcp_socket, std::shared_ptr< tcp::socket> tcp_socket)
 {
@@ -87,10 +80,9 @@ asio::awaitable<void> start_pipe(moon::kcp::connection_ptr kcp_socket)
 {
     try
     {
-        moon::kcp::console_log("kcp2tcp accept %s, and start tcp.async_connect", address(kcp_socket->get_socket()).data());
         std::shared_ptr< tcp::socket> tcp_socket = std::make_shared<tcp::socket>(kcp_socket->get_executor());
         co_await asio::async_connect(*tcp_socket, cfg.tcp_remote_endpoint, asio::use_awaitable);
-        moon::kcp::console_log("kcp2tcp accept %s, and tcp.async_connect success", address(kcp_socket->get_socket()).data());
+        moon::kcp::console_log("kcp server accept %s, and tcp.async_connect success", moon::kcp::address(kcp_socket->get_socket().local_endpoint()).data());
         asio::co_spawn(kcp_socket->get_executor(), kcp2tcp(kcp_socket, tcp_socket), asio::detached);
         asio::co_spawn(kcp_socket->get_executor(), tcp2kcp(tcp_socket, kcp_socket), asio::detached);
     }
@@ -118,33 +110,30 @@ asio::awaitable<void> run_kcp_server(moon::kcp::acceptor& acceptor)
 
 asio::awaitable<void> start_pipe(std::shared_ptr<tcp::socket> tcp_socket)
 {
-    moon::kcp::console_log("tcp2kcp accept %s, and start kcp.async_connect", address(*tcp_socket).data());
-    moon::kcp::connection_ptr kcp_socket;
     int try_times = 5;
     while (true)
     {
-        try
-        {
-            kcp_socket = co_await moon::kcp::async_connect(tcp_socket->get_executor(), cfg.udp_remote_endpoint, magic, 500);
-            break;
-        }
-        catch (const std::exception&)
-        {
-            --try_times;
+        auto res = co_await(moon::kcp::async_connect(tcp_socket->get_executor(), cfg.udp_remote_endpoint, magic) || timeout(500ms));
+        if (res.index() == 0) {
+            auto [ec, kcp_socket] = std::get<0>(res);
+            if (!ec) {
+                moon::kcp::console_log("tcp2kcp accept %s, and kcp.async_connect success", moon::kcp::address(tcp_socket->remote_endpoint()).data());
+                asio::co_spawn(tcp_socket->get_executor(), tcp2kcp(tcp_socket, kcp_socket), asio::detached);
+                asio::co_spawn(tcp_socket->get_executor(), kcp2tcp(kcp_socket, tcp_socket), asio::detached);
+                break;
+            }
+            else
+            {
+                moon::kcp::console_log("tcp2kcp accept %s, kcp connect failed: %s", moon::kcp::address(tcp_socket->remote_endpoint()).data(), ec.message().data());
+            }
         }
 
+        try_times--;
         if (try_times == 0)
         {
-            moon::kcp::console_log("kcp connect failed: timeout ");
+            moon::kcp::console_log("tcp2kcp accept %s, kcp connect failed: timeout", moon::kcp::address(tcp_socket->remote_endpoint()).data());
             break;
         }
-    }
-
-    if (kcp_socket)
-    {
-        moon::kcp::console_log("tcp2kcp accept %s, and kcp.async_connect success", address(*tcp_socket).data());
-        asio::co_spawn(tcp_socket->get_executor(), tcp2kcp(tcp_socket, kcp_socket), asio::detached);
-        asio::co_spawn(tcp_socket->get_executor(), kcp2tcp(kcp_socket, tcp_socket), asio::detached);
     }
 }
 

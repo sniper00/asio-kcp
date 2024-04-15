@@ -13,8 +13,8 @@ see `src/tcp_over_kcp.cpp`, a demo can convert tcp stream data to kcp packet or 
 - kcp2tcp: listen udp endpoint and read data then use tcp send it.
 
 ```shell
-tcp_over_kcp.exe -m tcp2kcp -l "0.0.0.0:6001" -r "127.0.0.1:6002"
-tcp_over_kcp.exe -m kcp2tcp -l "127.0.0.1:6002" -r "github.com:443"
+tcp_over_kcp-d.exe -m tcp2kcp -l "0.0.0.0:6001" -r "127.0.0.1:6002"
+tcp_over_kcp-d.exe -m kcp2tcp -l "127.0.0.1:6002" -r "github.com:443"
 ```
 
 # Sneak Peek

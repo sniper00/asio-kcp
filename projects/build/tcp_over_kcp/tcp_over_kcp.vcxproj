@@ -101,6 +101,7 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\..\..\src\error.hpp" />
     <ClInclude Include="..\..\..\src\kcp.hpp" />
   </ItemGroup>
   <ItemGroup>

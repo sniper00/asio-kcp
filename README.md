@@ -1,12 +1,20 @@
 # asio-kcp
 Modern use kcp with asio, support async_accept, async_connect, async_read, async_read_some, async_write and can use with asio coroutine.
 
-# Build
+# Use
+
+Dependencies (3rd dir):
+- [kcp](https://github.com/skywind3000/kcp)
+- asio (without boost)
+
+This library is header-only, making it easy to integrate into your projects.
+
+# Example
+
+## Build
 
 - Windows require vs2022
 - Linux require gcc11
-
-# Example
 
 see `src/tcp_over_kcp.cpp`, a demo can convert tcp stream data to kcp packet or convert kcp packet data to tcp stream data. it worked in 2 modes:
 - tcp2kcp: listen tcp endpoint and read data then use kcp send it.

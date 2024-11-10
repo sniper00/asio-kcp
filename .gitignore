@@ -15,6 +15,6 @@
 *.idb
 .vs/
 .vscode/
-projects/obj
-projects/bin
+build/obj
+build/bin
 

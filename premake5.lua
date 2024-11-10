@@ -29,31 +29,31 @@ workspace "tcp-over-kcp"
         warnings "High"
 
 project "kcp"
-    location "projects/build/kcp"
-    objdir "projects/obj/%{cfg.project.name}/%{cfg.platform}_%{cfg.buildcfg}"
-    targetdir "projects/bin/%{cfg.buildcfg}"
+    location "build/projects/kcp"
+    objdir "build/obj/%{cfg.project.name}/%{cfg.platform}_%{cfg.buildcfg}"
+    targetdir "build/bin/%{cfg.buildcfg}"
 
     kind "StaticLib"
     language "C"
     includedirs {
-        "./",
-        "./kcp",
+        "./3rd/kcp",
         }
-    files {"./kcp/**.h", "./kcp/**.c"}
+    files {"./3rd/**.h", "./3rd/**.c"}
 
 
 project "tcp_over_kcp"
-    location "projects/build/tcp_over_kcp"
-    objdir "projects/obj/%{cfg.project.name}/%{cfg.platform}_%{cfg.buildcfg}"
-    targetdir "projects/bin/%{cfg.buildcfg}"
+    location "build/projects/tcp_over_kcp"
+    objdir "build/obj/%{cfg.project.name}/%{cfg.platform}_%{cfg.buildcfg}"
+    targetdir "build/bin/%{cfg.buildcfg}"
 
     kind "ConsoleApp"
     language "C++"
     includedirs {
-        "./",
-        "./src",
+        "./3rd",
+        "./include",
+        "./example",
         }
-    files {"./src/**.h", "./src/**.hpp","./src/**.cpp"}
+    files {"./example/**.h", "./example/**.hpp","./example/**.cpp"}
     defines {
         "ASIO_STANDALONE" ,
         "ASIO_NO_DEPRECATED",

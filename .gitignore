@@ -17,4 +17,5 @@
 .vscode/
 projects/obj
 projects/bin
-
+projects/build
+build/

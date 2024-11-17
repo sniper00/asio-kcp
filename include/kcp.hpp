@@ -307,7 +307,7 @@ namespace moon
                 }
             private:
                 Handler handler_;
-                const MutableBuffer& buffer_;
+                MutableBuffer buffer_;
             };
 
             template <typename Handler, typename StreamBuffer>
@@ -400,14 +400,14 @@ namespace moon
                         if constexpr(some)
                         {
                             using op_t = read_some_op<std::decay_t<ReadHandler>, std::decay_t<Buffer>>;
-                            self_->read_op_ = std::make_unique<op_t>(std::forward<ReadHandler>(handler), buffer);
+                            self_->read_op_ = std::make_shared<op_t>(std::forward<ReadHandler>(handler), std::forward<Buffer>(buffer));
                             asio::post(get_executor(), [self_ = self_]()
                                        { self_->check_read_op(); });
                         }
                         else
                         {
                             using op_t = read_op<std::decay_t<ReadHandler>, std::decay_t<Buffer>>;
-                            self_->read_op_ = std::make_unique<op_t>(std::forward<ReadHandler>(handler), buffer, need);
+                            self_->read_op_ = std::make_shared<op_t>(std::forward<ReadHandler>(handler), std::forward<Buffer>(buffer), need);
                             asio::post(get_executor(), [self_ = self_]()
                                        { self_->check_read_op(); });
                         }

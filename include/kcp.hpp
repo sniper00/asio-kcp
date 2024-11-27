@@ -650,6 +650,9 @@ namespace moon
                 });
             }
         public:
+            using lowest_layer_type = connection;
+            using executor_type = asio::any_io_executor;
+
             connection(udp::socket* sock, uint32_t conv, udp::endpoint& endpoint, bool isserver)
                 : isserver_(isserver)
                 , conv_(conv)
@@ -682,9 +685,19 @@ namespace moon
                 }
             }
 
-            asio::any_io_executor get_executor()
+            const executor_type& get_executor() noexcept
             {
                 return sock_->get_executor();
+            }
+
+            lowest_layer_type& lowest_layer()
+            {
+                return *this;
+            }
+
+            const lowest_layer_type& lowest_layer() const
+            {
+                return *this;
             }
 
             /*
@@ -711,6 +724,13 @@ namespace moon
 
             template<typename ConstBuffer, typename WriteHandler>
             auto async_write(const ConstBuffer& buffer, WriteHandler&& handler)
+            {
+                return asio::async_initiate<WriteHandler, void(const std::error_code&, size_t)>(
+                    initiate_async_write(this), handler, buffer);
+            }
+
+            template<typename ConstBuffer, typename WriteHandler>
+            auto async_write_some(const ConstBuffer& buffer, WriteHandler&& handler)
             {
                 return asio::async_initiate<WriteHandler, void(const std::error_code&, size_t)>(
                     initiate_async_write(this), handler, buffer);
